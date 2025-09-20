@@ -53,6 +53,16 @@ class GeminiClient:
         response = self.model.generate_content(prompt, generation_config={"max_output_tokens": max_output_tokens})
         return (response.text or "").strip()
 
+    def summarize(self, text: str, target_ratio: float = 0.2) -> str:
+        """Summarize text to approximately target_ratio of original length."""
+        prompt = (
+            f"Please summarize the following text, reducing it to approximately {int(target_ratio * 100)}% of its original length. "
+            f"Keep all important information, key points, and factual details. "
+            f"Maintain the structure and organization of the original text.\n\n"
+            f"Text to summarize:\n{text}"
+        )
+        return self.generate(prompt, max_output_tokens=2048)
+
 
 class RAGPipeline:
     def __init__(self, store: FaissStore, embedder: EmbeddingsClient, llm: GeminiClient):

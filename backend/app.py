@@ -61,7 +61,13 @@ async def stats():
             except Exception:
                 all_stats.append({name: {"error": "unreachable"}})
 
-    return StatsResponse(vectors=0, dimension=0)  # placeholder
+    return StatsResponse(
+        vectors=0, 
+        files_indexed=0,
+        index_path="",
+        metadata_path="",
+        index_exists=False
+    )  # placeholder
     # ⚡ If you want to merge stats properly:
     # return {"servers": all_stats}
 
