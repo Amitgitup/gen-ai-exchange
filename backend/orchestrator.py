@@ -1,397 +1,266 @@
 """
-Advanced Multi-Level Summarization Orchestrator
-
-This module provides intelligent query routing and server management
-for the hierarchical summarization system.
+Advanced Multi-Level Summarization Orchestrator V2 (fixed)
 """
-
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
-
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from backend import config
-from backend.schemas import QueryRequest, QueryResponse, Citation
-
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
+# --- API Models ---
+class QueryRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = 5
+    max_output_tokens: Optional[int] = 1024
+    target_server: Optional[str] = None
+
+
+# --- Enums and Data Classes ---
 class QueryComplexity(Enum):
-    """Query complexity levels for routing decisions"""
-    SIMPLE = "simple"          # High-level overview, key points
-    MODERATE = "moderate"      # Summary, overview questions
-    DETAILED = "detailed"      # Specific facts, detailed information
-    COMPREHENSIVE = "comprehensive"  # Full document analysis
+    SIMPLE = "simple"
+    MODERATE = "moderate"
+    DETAILED = "detailed"
+    COMPREHENSIVE = "comprehensive"
 
 
 @dataclass
 class ServerConfig:
-    """Configuration for each summarization server"""
     name: str
     url: str
     level: int
-    compression_ratio: float
     description: str
-    max_tokens: int = 512
-    top_k: int = 5
 
 
+# --- Core Logic Components ---
 class QueryAnalyzer:
-    """Analyzes queries to determine complexity and routing strategy"""
-    
-    SIMPLE_KEYWORDS = {
-        "key points", "bullet", "concise", "short", "brief", "overview",
-        "main points", "highlights", "summary", "gist", "essence"
+    KEYWORD_MAP = {
+        QueryComplexity.COMPREHENSIVE: {"comprehensive", "full document", "entire policy"},
+        QueryComplexity.DETAILED: {"detailed", "section", "specific", "what are the"},
+        QueryComplexity.MODERATE: {"summary", "overview", "describe", "explain"},
+        QueryComplexity.SIMPLE: {"key points", "bullet points", "concise", "short"},
     }
-    
-    MODERATE_KEYWORDS = {
-        "summary", "overview", "brief", "describe", "explain", "what is",
-        "tell me about", "give me", "provide", "outline"
-    }
-    
-    DETAILED_KEYWORDS = {
-        "detailed", "full", "section", "law", "policy", "regulation",
-        "specific", "exact", "precise", "complete", "entire", "all",
-        "how does", "what are the", "explain in detail", "step by step"
-    }
-    
-    COMPREHENSIVE_KEYWORDS = {
-        "comprehensive", "complete analysis", "full document", "everything",
-        "entire policy", "all aspects", "thorough", "exhaustive"
-    }
-    
+
     @classmethod
     def analyze_query(cls, query: str) -> Tuple[QueryComplexity, float]:
-        """
-        Analyze query to determine complexity level and confidence score
-        
-        Returns:
-            Tuple of (complexity_level, confidence_score)
-        """
-        query_lower = query.lower()
-        
-        # Check for comprehensive queries
-        comprehensive_matches = sum(1 for kw in cls.COMPREHENSIVE_KEYWORDS if kw in query_lower)
-        if comprehensive_matches > 0:
-            return QueryComplexity.COMPREHENSIVE, min(0.9, 0.6 + comprehensive_matches * 0.1)
-        
-        # Check for detailed queries
-        detailed_matches = sum(1 for kw in cls.DETAILED_KEYWORDS if kw in query_lower)
-        if detailed_matches > 0:
-            return QueryComplexity.DETAILED, min(0.9, 0.5 + detailed_matches * 0.1)
-        
-        # Check for moderate queries
-        moderate_matches = sum(1 for kw in cls.MODERATE_KEYWORDS if kw in query_lower)
-        if moderate_matches > 0:
-            return QueryComplexity.MODERATE, min(0.8, 0.4 + moderate_matches * 0.1)
-        
-        # Check for simple queries
-        simple_matches = sum(1 for kw in cls.SIMPLE_KEYWORDS if kw in query_lower)
-        if simple_matches > 0:
-            return QueryComplexity.SIMPLE, min(0.8, 0.3 + simple_matches * 0.1)
-        
-        # Default to moderate for ambiguous queries
-        return QueryComplexity.MODERATE, 0.3
+        query_lower = (query or "").lower()
+        # Prefer more specific matches first (comprehensive/detailed)
+        order = [
+            QueryComplexity.COMPREHENSIVE,
+            QueryComplexity.DETAILED,
+            QueryComplexity.MODERATE,
+            QueryComplexity.SIMPLE,
+        ]
+        for complexity in order:
+            keywords = cls.KEYWORD_MAP.get(complexity, set())
+            if any(kw in query_lower for kw in keywords):
+                return complexity, 0.85
+        return QueryComplexity.MODERATE, 0.4
 
 
 class ServerManager:
-    """Manages communication with summarization servers"""
-    
     def __init__(self):
-        self.servers = {
-            "server1": ServerConfig(
-                name="server1",
-                url="http://localhost:8001",
-                level=1,
-                compression_ratio=0.1,
-                description="Full document ingestion and L1 summary",
-                max_tokens=1024,
-                top_k=8
-            ),
-            "server2": ServerConfig(
-                name="server2", 
-                url="http://localhost:8002",
-                level=2,
-                compression_ratio=0.2,
-                description="L2 summary (moderate compression)",
-                max_tokens=512,
-                top_k=5
-            ),
-            "server3": ServerConfig(
-                name="server3",
-                url="http://localhost:8003", 
-                level=3,
-                compression_ratio=0.1,
-                description="L3 ultra-summary (high compression)",
-                max_tokens=256,
-                top_k=3
-            )
+        self.servers: Dict[str, ServerConfig] = {
+            "server1": ServerConfig(name="Server 1", url="http://localhost:8001", level=1, description="Full document index"),
+            "server2": ServerConfig(name="Server 2", url="http://localhost:8002", level=2, description="Detailed summary index"),
+            "server3": ServerConfig(name="Server 3", url="http://localhost:8003", level=3, description="Key points index"),
         }
-        self.timeout = httpx.Timeout(30.0)
-    
-    async def check_server_health(self, server_name: str) -> bool:
-        """Check if a server is healthy and responsive"""
+        # default timeout for query_server
+        self.timeout = httpx.Timeout(60.0)
+
+    async def get_server_health(self, server_name: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        cfg = self.servers.get(server_name)
+        if cfg is None:
+            logger.warning("Health requested for unknown server: %s", server_name)
+            return False, None
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.get(f"{cfg.url.rstrip('/')}/health")
+                # Safe parse
+                try:
+                    body = res.json() if res.content else None
+                except Exception:
+                    body = {"raw_text": res.text}
+                return res.status_code == 200, body
+        except Exception as exc:
+            logger.debug("Health check error for %s: %s", server_name, exc)
+            return False, None
+
+    async def query_server(self, server_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = self.servers.get(server_name)
+        if cfg is None:
+            raise HTTPException(status_code=400, detail=f"Unknown server '{server_name}'")
+
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(f"{self.servers[server_name].url}/health")
-                return response.status_code == 200
-        except Exception as e:
-            logger.warning(f"Server {server_name} health check failed: {e}")
-            return False
-    
-    async def query_server(self, server_name: str, question: str, 
-                          top_k: Optional[int] = None, 
-                          max_tokens: Optional[int] = None) -> Dict[str, Any]:
-        """Query a specific server with the question"""
-        server = self.servers[server_name]
-        
-        params = {
-            "question": question,
-            "top_k": top_k or server.top_k,
-            "max_output_tokens": max_tokens or server.max_tokens
-        }
-        
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    f"{server.url}/query",
-                    params=params
-                )
+                response = await client.post(f"{cfg.url.rstrip('/')}/query", json=payload)
                 response.raise_for_status()
-                return response.json()
+                # response.json() can raise; guard it
+                try:
+                    return response.json()
+                except Exception:
+                    return {"raw_text": response.text}
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error querying {server_name}: {e}")
-            raise HTTPException(status_code=e.response.status_code, 
-                              detail=f"Server {server_name} returned error: {e.response.text}")
+            # Attempt to extract meaningful detail if possible
+            detail = None
+            try:
+                detail = e.response.json()
+            except Exception:
+                detail = {"status_text": e.response.text}
+            # wrap as HTTPException so FastAPI can handle it smoothly
+            raise HTTPException(status_code=e.response.status_code, detail=detail)
         except httpx.RequestError as e:
-            logger.error(f"Request error querying {server_name}: {e}")
-            raise HTTPException(status_code=503, 
-                              detail=f"Server {server_name} is unavailable: {str(e)}")
-    
-    async def get_server_stats(self, server_name: str) -> Dict[str, Any]:
-        """Get statistics from a specific server"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(f"{self.servers[server_name].url}/stats")
-                response.raise_for_status()
-                return response.json()
-        except Exception as e:
-            logger.warning(f"Failed to get stats from {server_name}: {e}")
-            return {"error": str(e)}
+            logger.error("RequestError when contacting %s: %s", server_name, e)
+            raise HTTPException(status_code=503, detail=f"{server_name} is unavailable: {str(e)}")
 
 
 class IntelligentRouter:
-    """Intelligent query routing with fallback strategies"""
-    
     def __init__(self, server_manager: ServerManager):
         self.server_manager = server_manager
         self.query_analyzer = QueryAnalyzer()
-    
+
     def select_primary_server(self, complexity: QueryComplexity) -> str:
-        """Select the primary server based on query complexity"""
-        if complexity == QueryComplexity.SIMPLE:
-            return "server3"  # Ultra-compressed summary
-        elif complexity == QueryComplexity.MODERATE:
-            return "server2"  # Moderate summary
-        elif complexity == QueryComplexity.DETAILED:
-            return "server1"  # Full document
-        else:  # COMPREHENSIVE
-            return "server1"  # Full document for comprehensive analysis
-    
-    def get_fallback_servers(self, primary_server: str) -> List[str]:
-        """Get fallback servers in order of preference"""
-        fallback_map = {
-            "server1": ["server2", "server3"],
-            "server2": ["server1", "server3"], 
-            "server3": ["server2", "server1"]
+        mapping = {
+            QueryComplexity.SIMPLE.value: "server3",
+            QueryComplexity.MODERATE.value: "server2",
+            # default for detailed/comprehensive -> server1
         }
-        return fallback_map.get(primary_server, ["server1"])
-    
-    async def route_query(self, question: str, 
-                         top_k: Optional[int] = None,
-                         max_tokens: Optional[int] = None,
-                         use_fallback: bool = True) -> Dict[str, Any]:
-        """
-        Route query to the most appropriate server with fallback support
-        
-        Args:
-            question: The user's question
-            top_k: Number of top results to retrieve
-            max_tokens: Maximum tokens for response
-            use_fallback: Whether to try fallback servers if primary fails
-            
-        Returns:
-            Response from the selected server
-        """
-        # Analyze query complexity
-        complexity, confidence = self.query_analyzer.analyze_query(question)
-        primary_server = self.select_primary_server(complexity)
-        
-        logger.info(f"Query analysis: {complexity.value} (confidence: {confidence:.2f}) -> {primary_server}")
-        
-        # Try primary server first
+        return mapping.get(complexity.value, "server1")
+
+    async def route_query(self, request: QueryRequest) -> Dict[str, Any]:
+        # If the client specified a target server, use it (but validate)
+        target = request.target_server
+        complexity, confidence = self.query_analyzer.analyze_query(request.question)
+
+        if not target or target not in self.server_manager.servers:
+            target = self.select_primary_server(complexity)
+            logger.info("Analyzed as %s, routing to %s", complexity.value, target)
+        else:
+            logger.info("Manual override to %s", target)
+
+        # Build payload robustly (support pydantic v1 & v2)
+        if hasattr(request, "model_dump"):
+            payload = request.model_dump()
+        else:
+            # fallback to pydantic v1 .dict()
+            payload = request.dict()
+
+        # Try primary, then fallback mapping
         try:
-            result = await self.server_manager.query_server(
-                primary_server, question, top_k, max_tokens
-            )
-            result["routing_info"] = {
-                "primary_server": primary_server,
-                "complexity": complexity.value,
-                "confidence": confidence,
-                "fallback_used": False
-            }
+            result = await self.server_manager.query_server(target, payload)
+            # ensure it's a dict
+            if not isinstance(result, dict):
+                result = {"result": result}
+            result["routing_info"] = {"primary_server": target, "complexity": complexity.value, "confidence": confidence}
             return result
-        except Exception as e:
-            logger.warning(f"Primary server {primary_server} failed: {e}")
-            
-            if not use_fallback:
-                raise e
-            
-            # Try fallback servers
-            fallback_servers = self.get_fallback_servers(primary_server)
-            last_error = e
-            
-            for fallback_server in fallback_servers:
-                try:
-                    logger.info(f"Trying fallback server: {fallback_server}")
-                    result = await self.server_manager.query_server(
-                        fallback_server, question, top_k, max_tokens
-                    )
-                    result["routing_info"] = {
-                        "primary_server": primary_server,
-                        "fallback_server": fallback_server,
-                        "complexity": complexity.value,
-                        "confidence": confidence,
-                        "fallback_used": True,
-                        "fallback_reason": str(last_error)
-                    }
-                    return result
-                except Exception as fallback_error:
-                    logger.warning(f"Fallback server {fallback_server} also failed: {fallback_error}")
-                    last_error = fallback_error
-            
-            # All servers failed
-            raise HTTPException(
-                status_code=503,
-                detail=f"All servers failed. Last error: {str(last_error)}"
-            )
+        except HTTPException as outer_exc:
+            # If primary server fails, attempt sensible fallback
+            logger.warning("Primary server %s failed with: %s. Attempting fallback.", target, outer_exc.detail)
+            fallback_map = {"server1": "server2", "server2": "server1", "server3": "server2"}
+            fallback = fallback_map.get(target, "server1")
+            try:
+                result = await self.server_manager.query_server(fallback, payload)
+                if not isinstance(result, dict):
+                    result = {"result": result}
+                result["routing_info"] = {"primary_server": target, "fallback_server": fallback, "complexity": complexity.value, "confidence": confidence}
+                return result
+            except HTTPException as exc2:
+                # Both primary and fallback failed -> surface error
+                logger.error("Fallback server %s also failed: %s", fallback, exc2.detail)
+                raise HTTPException(status_code=503, detail={"error": "Both primary and fallback servers failed", "primary_error": outer_exc.detail, "fallback_error": exc2.detail})
 
 
-# Global instances
+# --- FastAPI App Setup ---
+app = FastAPI(title="Advanced Summarization Orchestrator", version="2.0.0")
 server_manager = ServerManager()
 router = IntelligentRouter(server_manager)
 
-
-# FastAPI app for the orchestrator
-app = FastAPI(
-    title="Multi-Level Summarization Orchestrator",
-    description="Intelligent query routing for hierarchical document summarization",
-    version="2.0.0"
+# allow development origin; adapt in production
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
+# --- API Endpoints ---
 @app.get("/health")
 async def health_check():
-    """Health check for the orchestrator"""
-    server_status = {}
-    for server_name in server_manager.servers:
-        server_status[server_name] = await server_manager.check_server_health(server_name)
-    
-    healthy_servers = sum(server_status.values())
-    total_servers = len(server_status)
-    
-    return {
-        "status": "healthy" if healthy_servers > 0 else "degraded",
-        "orchestrator": "ok",
-        "servers": server_status,
-        "healthy_count": healthy_servers,
-        "total_count": total_servers
-    }
+    """Simple health check for the orchestrator itself."""
+    return {"status": "ok", "service": "Orchestrator"}
 
 
-@app.get("/stats")
-async def get_aggregated_stats():
-    """Get aggregated statistics from all servers"""
-    stats = {}
-    for server_name in server_manager.servers:
-        stats[server_name] = await server_manager.get_server_stats(server_name)
-    
-    return {
-        "servers": stats,
-        "timestamp": time.time(),
-        "orchestrator_version": "2.0.0"
-    }
+@app.get("/system/health")
+async def get_system_health():
+    """Provides a consolidated health status of all downstream servers."""
+    # prepare coroutines in insertion order
+    tasks = [server_manager.get_server_health(n) for n in server_manager.servers.keys()]
+    results = await asyncio.gather(*tasks)
+
+    statuses = {}
+    healthy_count = 0
+    for (name, cfg), (running, data) in zip(server_manager.servers.items(), results):
+        if running:
+            healthy_count += 1
+        # extract port safely (may not exist)
+        port = None
+        try:
+            # naive attempt to get final part after last ':'
+            port = cfg.url.rsplit(":", 1)[-1]
+        except Exception:
+            port = cfg.url
+        statuses[name] = {"name": cfg.name, "port": port, "description": cfg.description, "running": running, "health": data}
+
+    overall = "degraded"
+    if healthy_count == len(statuses):
+        overall = "healthy"
+    elif healthy_count == 0:
+        overall = "unhealthy"
+
+    return {"timestamp": time.time(), "servers": statuses, "overall_health": overall, "healthy_count": healthy_count, "total_count": len(statuses)}
 
 
-@app.post("/query", response_model=QueryResponse)
+@app.post("/ingest")
+async def ingest_documents(request: Request):
+    """Forwards ingestion requests to Server 1."""
+    cfg = server_manager.servers.get("server1")
+    if cfg is None:
+        raise HTTPException(status_code=500, detail="Ingestion server not configured.")
+
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {e}")
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            res = await client.post(f"{cfg.url.rstrip('/')}/ingest", json=body)
+            # try to forward body and status code transparently
+            try:
+                content = res.json() if res.content else None
+            except Exception:
+                content = {"raw_text": res.text}
+            return JSONResponse(status_code=res.status_code, content=content)
+    except httpx.RequestError as e:
+        logger.error("Ingestion request to server1 failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"Ingestion failed: {e}")
+
+
+@app.post("/query")
 async def intelligent_query(request: QueryRequest):
-    """
-    Intelligent query routing with automatic server selection
-    """
-    try:
-        result = await router.route_query(
-            question=request.question,
-            top_k=request.top_k,
-            max_tokens=request.max_output_tokens,
-            use_fallback=True
-        )
-        
-        # Convert citations to proper format
-        citations = []
-        for citation_data in result.get("citations", []):
-            citations.append(Citation(**citation_data))
-        
-        return QueryResponse(
-            answer=result.get("answer", ""),
-            citations=citations,
-            used_top_k=result.get("routing_info", {}).get("top_k", request.top_k or 5),
-            prompt=result.get("prompt", "")
-        )
-    except Exception as e:
-        logger.error(f"Query failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/query/{server_name}")
-async def direct_query(server_name: str, request: QueryRequest):
-    """
-    Direct query to a specific server (bypasses intelligent routing)
-    """
-    if server_name not in server_manager.servers:
-        raise HTTPException(status_code=404, detail=f"Server {server_name} not found")
-    
-    try:
-        result = await server_manager.query_server(
-            server_name, 
-            request.question,
-            request.top_k,
-            request.max_output_tokens
-        )
-        
-        citations = []
-        for citation_data in result.get("citations", []):
-            citations.append(Citation(**citation_data))
-        
-        return QueryResponse(
-            answer=result.get("answer", ""),
-            citations=citations,
-            used_top_k=request.top_k or server_manager.servers[server_name].top_k,
-            prompt=result.get("prompt", "")
-        )
-    except Exception as e:
-        logger.error(f"Direct query to {server_name} failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    """Handles intelligent query routing and returns the result."""
+    result = await router.route_query(request)
+    # Return as JSONResponse to avoid FastAPI double-encoding possible HTTPException content
+    return JSONResponse(content=result)

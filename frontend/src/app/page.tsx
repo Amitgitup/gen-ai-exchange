@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+// --- TYPE DEFINITIONS ---
 type Citation = {
   source_file: string;
   page_start: number;
@@ -50,7 +51,8 @@ type SystemStatus = {
   total_count: number;
 };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+// Use a more descriptive name for the orchestrator's base URL
+const ORCHESTRATOR_BASE_URL = "http://localhost:8000";
 
 export default function HomePage() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -76,46 +78,51 @@ export default function HomePage() {
 
   const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
 
+  // Fetch consolidated system health from a dedicated orchestrator endpoint
   async function fetchSystemStatus() {
     try {
-      const res = await fetch(`${API_BASE}/stats`);
+      const res = await fetch(`${ORCHESTRATOR_BASE_URL}/system/health`);
       if (res.ok) {
-        const data = await res.json();
+        const data: SystemStatus = await res.json();
         setSystemStatus(data);
+      } else {
+        setSystemStatus(null);
+        console.error("Failed to fetch system status:", res.statusText);
       }
     } catch (e) {
       console.error("Failed to fetch system status:", e);
+      setSystemStatus(null);
     }
   }
 
+  // Remove frontend fallback logic. Only call the orchestrator.
   async function handleIngest() {
     try {
       setIngesting(true);
-      // Try orchestrator first, then fallback to server1
-      let res = await fetch(`${API_BASE}/ingest`, {
+      const res = await fetch(`${ORCHESTRATOR_BASE_URL}/ingest`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ force_rebuild: true }),
       });
-      
+
       if (!res.ok) {
-        // Fallback to server1 direct ingestion
-        res = await fetch(`${API_BASE.replace(':8000', ':8001')}/ingest`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-        });
+        const errorData = await res.json();
+        throw new Error(errorData.detail || "Ingestion request failed");
       }
       
       const data = await res.json();
-      alert(`Ingestion: ${data.message || 'Success'} (files=${data.files_processed || data.chunks || 'N/A'}, chunks=${data.chunks_added || data.chunks || 'N/A'})`);
-    } catch (e) {
+      alert(`Ingestion: ${data.message || 'Success'} (files=${data.files_processed || 'N/A'}, chunks=${data.chunks_added || 'N/A'})`);
+
+    } catch (e: any) {
       console.error(e);
-      alert("Ingestion failed - see console");
+      alert(`Ingestion failed: ${e.message}`);
     } finally {
       setIngesting(false);
+      fetchSystemStatus(); // Refresh status after ingestion
     }
   }
-
+  
+  // Refactor query to use a stable endpoint and send routing hints in the body
   async function handleSend() {
     if (!canSend) return;
     const question = input.trim();
@@ -124,26 +131,23 @@ export default function HomePage() {
     setLoading(true);
     
     try {
-      let url = `${API_BASE}/query`;
-      
-      // If specific server selected, use direct query
-      if (selectedServer !== "auto") {
-        url = `${API_BASE}/query/${selectedServer}`;
-      }
-      
+      const url = `${ORCHESTRATOR_BASE_URL}/query`;
+      const requestBody = {
+        question,
+        top_k: topK,
+        max_output_tokens: maxTokens,
+        ...(selectedServer !== "auto" && { target_server: selectedServer }),
+      };
+
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          question, 
-          top_k: topK, 
-          max_output_tokens: maxTokens 
-        }),
+        body: JSON.stringify(requestBody),
       });
       
       if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || `HTTP ${res.status}`);
+        const errorData = await res.json();
+        throw new Error(errorData.detail || `HTTP Error ${res.status}`);
       }
       
       const data = await res.json();
@@ -155,13 +159,14 @@ export default function HomePage() {
         prompt: data.prompt,
       };
       setMessages((prev) => [...prev, assistant]);
+
     } catch (e: any) {
       console.error(e);
       setMessages((prev) => [
         ...prev,
         { 
           role: "assistant", 
-          content: `Error: ${e.message || "failed to connect to server. Please ensure the backend is running."}`, 
+          content: `Error: ${e.message || "Failed to connect to the server."}`, 
           citations: [] 
         },
       ]);
@@ -176,34 +181,13 @@ export default function HomePage() {
       handleSend();
     }
   }
-
-  const getServerColor = (server: string) => {
-    switch (server) {
-      case "server1": return "bg-blue-500";
-      case "server2": return "bg-green-500";
-      case "server3": return "bg-purple-500";
-      case "orchestrator": return "bg-orange-500";
-      default: return "bg-gray-500";
-    }
-  };
-
-  const getComplexityColor = (complexity: string) => {
-    switch (complexity) {
-      case "simple": return "text-green-400";
-      case "moderate": return "text-yellow-400";
-      case "detailed": return "text-blue-400";
-      case "comprehensive": return "text-red-400";
-      default: return "text-gray-400";
-    }
-  };
-
+  
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-slate-100 flex flex-col">
-      {/* Header */}
       <header className="border-b border-slate-700 px-4 py-4 flex items-center gap-4 sticky top-0 bg-slate-900/80 backdrop-blur-lg z-10">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 bg-gradient-to-r from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
-            <span className="text-white font-bold text-sm">ML</span>
+            <span className="text-white font-bold text-sm">AI</span>
           </div>
           <div>
             <div className="font-bold text-lg">Multi-Level Summarization</div>
@@ -212,7 +196,6 @@ export default function HomePage() {
         </div>
         
         <div className="ml-auto flex items-center gap-4">
-          {/* System Status Indicator */}
           <button
             onClick={() => setShowSystemStatus(!showSystemStatus)}
             className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
@@ -223,10 +206,9 @@ export default function HomePage() {
                 : "bg-red-600 hover:bg-red-500"
             }`}
           >
-            {systemStatus ? `${systemStatus.healthy_count}/${systemStatus.total_count} Servers` : "System Status"}
+            {systemStatus ? `${systemStatus.healthy_count}/${systemStatus.total_count} Servers Online` : "System Offline"}
           </button>
           
-          {/* Server Selection */}
           <select
             value={selectedServer}
             onChange={(e) => setSelectedServer(e.target.value)}
@@ -238,7 +220,6 @@ export default function HomePage() {
             <option value="server3">📋 Server 3 (L3 Summary)</option>
           </select>
           
-          {/* Ingest Button */}
           <button
             onClick={handleIngest}
             disabled={ingesting}
@@ -249,32 +230,34 @@ export default function HomePage() {
         </div>
       </header>
 
-      {/* System Status Panel */}
-      {showSystemStatus && systemStatus && (
+      {showSystemStatus && (
         <div className="bg-slate-800 border-b border-slate-700 p-4">
           <div className="container mx-auto max-w-6xl">
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-              {Object.entries(systemStatus.servers).map(([name, server]) => (
-                <div key={name} className="bg-slate-700 rounded-lg p-3">
-                  <div className="flex items-center gap-2 mb-2">
-                    <div className={`w-3 h-3 rounded-full ${server.running ? 'bg-green-400' : 'bg-red-400'}`}></div>
-                    <span className="font-medium text-sm">{server.name}</span>
-                  </div>
-                  <div className="text-xs text-slate-400">{server.description}</div>
-                  {server.health?.stats && (
-                    <div className="mt-2 text-xs">
-                      <div>Vectors: {server.health.stats.vectors}</div>
-                      <div>Files: {server.health.stats.files_indexed}</div>
+            {systemStatus ? (
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                {Object.entries(systemStatus.servers).map(([name, server]) => (
+                  <div key={name} className="bg-slate-700 rounded-lg p-3">
+                    <div className="flex items-center gap-2 mb-2">
+                      <div className={`w-3 h-3 rounded-full ${server.running ? 'bg-green-400' : 'bg-red-400'}`}></div>
+                      <span className="font-medium text-sm">{server.name}</span>
                     </div>
-                  )}
-                </div>
-              ))}
-            </div>
+                    <div className="text-xs text-slate-400">{server.description}</div>
+                    {server.health?.stats && (
+                      <div className="mt-2 text-xs">
+                        <div>Vectors: {server.health.stats.vectors}</div>
+                        <div>Files: {server.health.stats.files_indexed}</div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center text-slate-400">Could not retrieve system status.</div>
+            )}
           </div>
         </div>
       )}
-
-      {/* Main Content */}
+      
       <main className="flex-1 container mx-auto max-w-5xl px-4 py-6">
         <div className="space-y-6">
           {messages.length === 0 && (
@@ -318,7 +301,6 @@ export default function HomePage() {
         </div>
       </main>
 
-      {/* Footer */}
       <footer className="border-t border-slate-700 p-4 bg-slate-900/50">
         <div className="container mx-auto max-w-5xl">
           <div className="flex gap-3">
@@ -339,7 +321,7 @@ export default function HomePage() {
           </div>
           
           <div className="flex items-center justify-between mt-3 text-xs text-slate-500">
-            <div>Backend: {API_BASE}</div>
+            <div>Backend: {ORCHESTRATOR_BASE_URL}</div>
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
                 <label>Top-K:</label>
@@ -371,7 +353,10 @@ export default function HomePage() {
   );
 }
 
+// --- SUB-COMPONENTS & HELPERS ---
+
 function MessageBubble({ message }: { message: Message }) {
+  // Handle user messages
   if (message.role === "user") {
     return (
       <div className="flex justify-end">
@@ -382,13 +367,13 @@ function MessageBubble({ message }: { message: Message }) {
     );
   }
 
+  // Handle assistant messages
   return (
     <div className="flex justify-start">
       <div className="w-full">
-        {/* Routing Information */}
         {message.routing_info && (
           <div className="mb-3 flex items-center gap-2 text-sm">
-            <div className={`px-2 py-1 rounded-full text-xs font-medium ${getServerColor(message.routing_info.primary_server)}`}>
+            <div className={`px-2 py-1 rounded-full text-xs font-medium text-white ${getServerColor(message.routing_info.primary_server)}`}>
               {message.routing_info.primary_server}
             </div>
             <span className={`font-medium ${getComplexityColor(message.routing_info.complexity)}`}>
@@ -403,12 +388,10 @@ function MessageBubble({ message }: { message: Message }) {
           </div>
         )}
         
-        {/* Message Content */}
         <div className="max-w-[90%] bg-slate-800 rounded-2xl px-6 py-4 shadow-lg border border-slate-700">
           <div className="whitespace-pre-wrap">{message.content || ""}</div>
         </div>
         
-        {/* Citations */}
         {message.citations && message.citations.length > 0 && (
           <div className="mt-4 max-w-[90%]">
             <div className="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden">
@@ -437,7 +420,6 @@ function MessageBubble({ message }: { message: Message }) {
           </div>
         )}
         
-        {/* Prompt Viewer */}
         {message.prompt && <PromptViewer prompt={message.prompt} />}
       </div>
     </div>
@@ -463,7 +445,6 @@ function PromptViewer({ prompt }: { prompt: string }) {
   );
 }
 
-// Helper functions
 function getServerColor(server: string) {
   switch (server) {
     case "server1": return "bg-blue-500";
@@ -483,3 +464,4 @@ function getComplexityColor(complexity: string) {
     default: return "text-gray-400";
   }
 }
+
